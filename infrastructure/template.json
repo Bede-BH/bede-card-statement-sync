@@ -1,0 +1,684 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Monthly BEDE statement sync - pulls PGP-encrypted statements from the vendor SFTP via a Transfer Family connector, decrypts them, and stores plaintext in S3.",
+  "Parameters": {
+    "ApplicationName": {
+      "Type": "String",
+      "Default": "statement-sync",
+      "Description": "Top-level folder in the artifact bucket and prefix for resource names."
+    },
+    "BucketName": {
+      "Type": "String",
+      "Default": "093479354694-bede-statement-sync",
+      "Description": "Landing bucket created by this stack. Holds listings/, incoming/, decrypted/, state/."
+    },
+    "CodeBucket": {
+      "Type": "String",
+      "Default": "273366118370-artifacts-eu-west-1",
+      "Description": "Artifact bucket holding the Lambda zips. MUST be in the same region as this stack."
+    },
+    "ConnectorId": {
+      "Type": "String",
+      "Default": "c-4b33fa70fe1846509",
+      "Description": "Existing Transfer Family SFTP connector. Its access role must be extended to this bucket before deploying."
+    },
+    "RemoteDirectoryBasePath": {
+      "Type": "String",
+      "Default": "/22-BEDE/Production/Outbound/Statements",
+      "Description": "Parent folder on the vendor SFTP. The MMMYY month folder is appended at runtime."
+    },
+    "PgpLayerArn": {
+      "Type": "String",
+      "Description": "Lambda layer providing pgpy. Must be the same region and architecture (x86_64) as the existing account-sync layer."
+    },
+    "PgpKeySecretName": {
+      "Type": "String",
+      "Default": "daily-vendor-reflection/pgp-private-key",
+      "Description": "Secrets Manager secret holding the PGP private key. Shared with account-sync."
+    },
+    "PgpPassphraseSecretName": {
+      "Type": "String",
+      "Default": "daily-vendor-reflection/pgp-key-passphrase",
+      "Description": "Secrets Manager secret holding the PGP key passphrase."
+    },
+    "AlertEmailAddress": {
+      "Type": "String",
+      "Description": "Email address subscribed to this stack's own alert topic. The subscription must be confirmed from the inbox before alerts deliver."
+    },
+    "PullVendorStatementsVersion": {
+      "Type": "String",
+      "Default": "v1.0",
+      "Description": "Version suffix of the pull Lambda zip in the artifact bucket."
+    },
+    "DecryptVendorStatementVersion": {
+      "Type": "String",
+      "Default": "v1.0",
+      "Description": "Version suffix of the decrypt Lambda zip in the artifact bucket."
+    },
+    "SchedulerCronExpression": {
+      "Type": "String",
+      "Default": "cron(0 * 1 * ? *)",
+      "Description": "Hourly on day 1 of every month. The calendar caps polling at 24 attempts."
+    },
+    "SchedulerTimezone": {
+      "Type": "String",
+      "Default": "UTC",
+      "Description": "IANA timezone name for the cron expression, also passed to the Lambda so period resolution and FinalAttemptHour agree with it. Use UTC or Asia/Bahrain (UTC+3). Note GMT is UTC+0, not Bahrain time."
+    },
+    "SchedulerEnabled": {
+      "Type": "String",
+      "Default": "DISABLED",
+      "AllowedValues": [
+        "ENABLED",
+        "DISABLED"
+      ],
+      "Description": "Deploy disabled, smoke test manually, then enable."
+    },
+    "FinalAttemptHour": {
+      "Type": "Number",
+      "Default": 23,
+      "Description": "Hour, in SchedulerTimezone, after which a still-empty vendor folder raises an alert."
+    },
+    "MaxListingItems": {
+      "Type": "Number",
+      "Default": 10000,
+      "Description": "MaxItems for StartDirectoryListing. Service maximum is 10000. The Lambda fails loudly if the listing truncates."
+    },
+    "DecryptReservedConcurrency": {
+      "Type": "Number",
+      "Default": 20,
+      "Description": "Caps parallel decrypts. Raise as monthly file count grows; excess S3 events queue and retry automatically."
+    },
+    "IncomingRetentionDays": {
+      "Type": "Number",
+      "Default": 90,
+      "Description": "Days before encrypted originals under incoming/ expire."
+    },
+    "LogRetentionDays": {
+      "Type": "Number",
+      "Default": 30,
+      "Description": "CloudWatch Logs retention for both functions."
+    }
+  },
+  "Resources": {
+    "AlertTopic": {
+      "Type": "AWS::SNS::Topic",
+      "Properties": {
+        "TopicName": {
+          "Fn::Sub": "bede-${ApplicationName}-alerts"
+        },
+        "DisplayName": "BEDE Statement Sync"
+      }
+    },
+    "AlertEmailSubscription": {
+      "Type": "AWS::SNS::Subscription",
+      "Properties": {
+        "TopicArn": {
+          "Ref": "AlertTopic"
+        },
+        "Protocol": "email",
+        "Endpoint": {
+          "Ref": "AlertEmailAddress"
+        }
+      }
+    },
+    "StatementsBucket": {
+      "Type": "AWS::S3::Bucket",
+      "DependsOn": [
+        "DecryptInvokePermission"
+      ],
+      "Properties": {
+        "BucketName": {
+          "Ref": "BucketName"
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "Id": "ExpireEncryptedOriginals",
+              "Status": "Enabled",
+              "Prefix": "incoming/",
+              "ExpirationInDays": {
+                "Ref": "IncomingRetentionDays"
+              }
+            },
+            {
+              "Id": "ExpireListings",
+              "Status": "Enabled",
+              "Prefix": "listings/",
+              "ExpirationInDays": 30
+            },
+            {
+              "Id": "ExpireOldVersions",
+              "Status": "Enabled",
+              "NoncurrentVersionExpirationInDays": 30
+            }
+          ]
+        },
+        "NotificationConfiguration": {
+          "LambdaConfigurations": [
+            {
+              "Event": "s3:ObjectCreated:*",
+              "Filter": {
+                "S3Key": {
+                  "Rules": [
+                    {
+                      "Name": "prefix",
+                      "Value": "incoming/"
+                    },
+                    {
+                      "Name": "suffix",
+                      "Value": ".pgp"
+                    }
+                  ]
+                }
+              },
+              "Function": {
+                "Fn::GetAtt": [
+                  "DecryptVendorStatementFunction",
+                  "Arn"
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "DecryptInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "DecryptVendorStatementFunction",
+            "Arn"
+          ]
+        },
+        "Principal": "s3.amazonaws.com",
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        },
+        "SourceArn": {
+          "Fn::Sub": "arn:aws:s3:::${BucketName}"
+        }
+      }
+    },
+    "PullLambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "bede-${ApplicationName}-pull-lambda-role"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Policies": [
+          {
+            "PolicyName": "PullLambdaPermissions",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "TransferFamilyConnectorAccess",
+                  "Effect": "Allow",
+                  "Action": [
+                    "transfer:StartDirectoryListing",
+                    "transfer:StartFileTransfer"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:transfer:${AWS::Region}:${AWS::AccountId}:connector/${ConnectorId}"
+                  }
+                },
+                {
+                  "Sid": "ReadListingsAndMarkers",
+                  "Effect": "Allow",
+                  "Action": "s3:GetObject",
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:aws:s3:::${BucketName}/listings/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:aws:s3:::${BucketName}/state/*"
+                    }
+                  ]
+                },
+                {
+                  "Sid": "WriteRunMarker",
+                  "Effect": "Allow",
+                  "Action": "s3:PutObject",
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${BucketName}/state/*"
+                  }
+                },
+                {
+                  "Sid": "ListBucketForHeadObject",
+                  "Effect": "Allow",
+                  "Action": "s3:ListBucket",
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${BucketName}"
+                  }
+                },
+                {
+                  "Sid": "PublishAlerts",
+                  "Effect": "Allow",
+                  "Action": "sns:Publish",
+                  "Resource": {
+                    "Ref": "AlertTopic"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "DecryptLambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "bede-${ApplicationName}-decrypt-lambda-role"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Policies": [
+          {
+            "PolicyName": "DecryptLambdaPermissions",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "ReadEncryptedOriginals",
+                  "Effect": "Allow",
+                  "Action": "s3:GetObject",
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${BucketName}/incoming/*"
+                  }
+                },
+                {
+                  "Sid": "WriteDecrypted",
+                  "Effect": "Allow",
+                  "Action": "s3:PutObject",
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${BucketName}/decrypted/*"
+                  }
+                },
+                {
+                  "Sid": "ReadPgpSecrets",
+                  "Effect": "Allow",
+                  "Action": "secretsmanager:GetSecretValue",
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${PgpKeySecretName}-*"
+                    },
+                    {
+                      "Fn::Sub": "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${PgpPassphraseSecretName}-*"
+                    }
+                  ]
+                },
+                {
+                  "Sid": "PublishAlerts",
+                  "Effect": "Allow",
+                  "Action": "sns:Publish",
+                  "Resource": {
+                    "Ref": "AlertTopic"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "PullVendorStatementsLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/aws/lambda/pull-vendor-statements",
+        "RetentionInDays": {
+          "Ref": "LogRetentionDays"
+        }
+      }
+    },
+    "DecryptVendorStatementLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/aws/lambda/decrypt-vendor-statement",
+        "RetentionInDays": {
+          "Ref": "LogRetentionDays"
+        }
+      }
+    },
+    "PullVendorStatementsFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": [
+        "PullVendorStatementsLogGroup"
+      ],
+      "Properties": {
+        "FunctionName": "pull-vendor-statements",
+        "Runtime": "python3.12",
+        "Architectures": [
+          "x86_64"
+        ],
+        "Handler": "index.lambda_handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "PullLambdaRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 900,
+        "MemorySize": 256,
+        "Environment": {
+          "Variables": {
+            "CONNECTOR_ID": {
+              "Ref": "ConnectorId"
+            },
+            "REMOTE_DIRECTORY_BASE_PATH": {
+              "Ref": "RemoteDirectoryBasePath"
+            },
+            "BUCKET_NAME": {
+              "Ref": "BucketName"
+            },
+            "ALERT_TOPIC_ARN": {
+              "Ref": "AlertTopic"
+            },
+            "MAX_LISTING_ITEMS": {
+              "Ref": "MaxListingItems"
+            },
+            "FINAL_ATTEMPT_HOUR": {
+              "Ref": "FinalAttemptHour"
+            },
+            "TIMEZONE": {
+              "Ref": "SchedulerTimezone"
+            }
+          }
+        },
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Fn::Sub": "${ApplicationName}/lambdas/pull-vendor-statements/pull-vendor-statements-${PullVendorStatementsVersion}.zip"
+          }
+        }
+      }
+    },
+    "DecryptVendorStatementFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": [
+        "DecryptVendorStatementLogGroup"
+      ],
+      "Properties": {
+        "FunctionName": "decrypt-vendor-statement",
+        "Runtime": "python3.12",
+        "Architectures": [
+          "x86_64"
+        ],
+        "Handler": "index.lambda_handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "DecryptLambdaRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 120,
+        "MemorySize": 512,
+        "ReservedConcurrentExecutions": {
+          "Ref": "DecryptReservedConcurrency"
+        },
+        "Layers": [
+          {
+            "Ref": "PgpLayerArn"
+          }
+        ],
+        "Environment": {
+          "Variables": {
+            "PGP_KEY_SECRET_NAME": {
+              "Ref": "PgpKeySecretName"
+            },
+            "PGP_PASSPHRASE_SECRET_NAME": {
+              "Ref": "PgpPassphraseSecretName"
+            },
+            "ALERT_TOPIC_ARN": {
+              "Ref": "AlertTopic"
+            }
+          }
+        },
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Fn::Sub": "${ApplicationName}/lambdas/decrypt-vendor-statement/decrypt-vendor-statement-${DecryptVendorStatementVersion}.zip"
+          }
+        }
+      }
+    },
+    "SchedulerRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "bede-${ApplicationName}-scheduler-role"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "scheduler.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "InvokePullLambda",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "lambda:InvokeFunction",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "PullVendorStatementsFunction",
+                      "Arn"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "MonthlySchedule": {
+      "Type": "AWS::Scheduler::Schedule",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "bede-${ApplicationName}-trigger"
+        },
+        "Description": "Hourly on day 1. The pull Lambda no-ops once the month's run marker exists.",
+        "ScheduleExpression": {
+          "Ref": "SchedulerCronExpression"
+        },
+        "ScheduleExpressionTimezone": {
+          "Ref": "SchedulerTimezone"
+        },
+        "State": {
+          "Ref": "SchedulerEnabled"
+        },
+        "FlexibleTimeWindow": {
+          "Mode": "OFF"
+        },
+        "Target": {
+          "Arn": {
+            "Fn::GetAtt": [
+              "PullVendorStatementsFunction",
+              "Arn"
+            ]
+          },
+          "RoleArn": {
+            "Fn::GetAtt": [
+              "SchedulerRole",
+              "Arn"
+            ]
+          },
+          "Input": "{}",
+          "RetryPolicy": {
+            "MaximumRetryAttempts": 2,
+            "MaximumEventAgeInSeconds": 3600
+          }
+        }
+      }
+    },
+    "PullErrorsAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "bede-${ApplicationName}-pull-errors"
+        },
+        "AlarmDescription": "Catches pull Lambda failures the handler cannot report itself - timeouts, out-of-memory, init errors.",
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "PullVendorStatementsFunction"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlertTopic"
+          }
+        ]
+      }
+    },
+    "DecryptErrorsAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "bede-${ApplicationName}-decrypt-errors"
+        },
+        "AlarmDescription": "Catches decrypt Lambda failures the handler cannot report itself - timeouts, out-of-memory, init errors.",
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "DecryptVendorStatementFunction"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "AlertTopic"
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "BucketNameOutput": {
+      "Description": "Landing bucket for listings, encrypted originals and decrypted output.",
+      "Value": {
+        "Ref": "StatementsBucket"
+      }
+    },
+    "PullFunctionArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "PullVendorStatementsFunction",
+          "Arn"
+        ]
+      }
+    },
+    "DecryptFunctionArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "DecryptVendorStatementFunction",
+          "Arn"
+        ]
+      }
+    },
+    "ScheduleName": {
+      "Value": {
+        "Ref": "MonthlySchedule"
+      }
+    },
+    "ConnectorAccessRoleReminder": {
+      "Description": "Manual prerequisite",
+      "Value": {
+        "Fn::Sub": "Extend the access role of connector ${ConnectorId} with s3:PutObject on arn:aws:s3:::${BucketName}/listings/* and /incoming/*"
+      }
+    },
+    "AlertTopicArn": {
+      "Description": "Alert topic owned by this stack. Confirm the email subscription before relying on it.",
+      "Value": {
+        "Ref": "AlertTopic"
+      }
+    },
+    "AlarmNames": {
+      "Description": "CloudWatch alarms publishing to the alert topic.",
+      "Value": {
+        "Fn::Sub": "bede-${ApplicationName}-pull-errors, bede-${ApplicationName}-decrypt-errors"
+      }
+    }
+  }
+}
