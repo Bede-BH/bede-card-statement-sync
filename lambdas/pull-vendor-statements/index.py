@@ -1,12 +1,19 @@
-"""Pull all vendor statement files for a reporting month.
+"""Incrementally pull vendor statement files for a reporting month.
 
-Invoked hourly on day 1 by EventBridge Scheduler. Exits immediately if the
-month has already been processed, so the extra invocations are free no-ops.
+Invoked hourly on day 1 by EventBridge Scheduler, 16:00 to 23:00 Bahrain
+time. The vendor states files are available from 14:00 but gives no signal
+that their upload has finished, so every tick re-lists the folder and
+transfers only the filenames not already collected.
+
+Each run appends to a ledger at state/YYYY-MM.run.json holding the
+cumulative set of files pulled so far, plus a per-tick record of what was
+added. Comparison is by filename set, not count: a same-count swap on the
+vendor side would be invisible to a count check.
 
 Optional event overrides:
-    {"period": "Aug26"}     - explicit vendor folder name
-    {"period": "2026-08"}   - same month, ISO form
-    {"force": true}         - ignore the run marker (backfill / re-run)
+    {"period": "Sep26"}     - explicit vendor folder name
+    {"period": "2026-09"}   - same month, ISO form
+    {"force": true}         - discard the ledger and re-pull everything
 """
 
 import boto3
@@ -72,19 +79,26 @@ def marker_key(period):
     return f"state/{period}.run.json"
 
 
-def marker_exists(period):
+def load_ledger(period, remote_dir, dest_prefix):
+    """Cumulative record of what has been pulled this month.
+
+    Absent on the first tick. Returned empty rather than raising so the
+    caller has one code path.
+    """
     try:
-        s3.head_object(Bucket=BUCKET, Key=marker_key(period))
-        return True
+        body = s3.get_object(Bucket=BUCKET, Key=marker_key(period))["Body"].read()
+        return json.loads(body)
     except s3.exceptions.ClientError as e:
         if e.response["Error"]["Code"] in NOT_FOUND:
-            return False
+            return {"period": period, "remoteDirectory": remote_dir,
+                    "destinationPrefix": dest_prefix, "pulledFiles": [],
+                    "waves": []}
         raise
 
 
-def write_marker(period, payload):
+def write_ledger(period, ledger):
     s3.put_object(Bucket=BUCKET, Key=marker_key(period),
-                  Body=json.dumps(payload, indent=2).encode("utf-8"),
+                  Body=json.dumps(ledger, indent=2).encode("utf-8"),
                   ContentType="application/json")
 
 
@@ -190,36 +204,60 @@ def lambda_handler(event, context):
     period, folder = resolve_period(event)
     remote_dir = f"{BASE_DIR}/{folder}"
     dest_prefix = f"incoming/{period}"
+    final = is_final_attempt()
 
     try:
-        if not event.get("force") and marker_exists(period):
-            print(f"{period} already processed - exiting")
-            return {"status": "already_processed", "period": period}
+        if event.get("force"):
+            ledger = {"period": period, "remoteDirectory": remote_dir,
+                      "destinationPrefix": dest_prefix, "pulledFiles": [],
+                      "waves": []}
+        else:
+            ledger = load_ledger(period, remote_dir, dest_prefix)
 
-        names = list_remote_files(remote_dir)
+        pulled = set(ledger.get("pulledFiles", []))
+        listed = set(list_remote_files(remote_dir) or [])
 
-        if not names:
-            if is_final_attempt():
+        # Filename set, not count. A vendor-side swap that leaves the count
+        # unchanged would be invisible to a count comparison.
+        new_files = sorted(listed - pulled)
+        gone = sorted(pulled - listed)
+        if gone:
+            print(f"WARN {len(gone)} previously pulled file(s) no longer "
+                  f"listed remotely: {gone}")
+
+        if not listed:
+            if final:
                 alert(f"Statement sync: no files for {period}",
-                      f"Nothing found in {remote_dir} by end of day. "
-                      f"Vendor drop may be late.")
+                      f"Nothing found in {remote_dir} by the end of the "
+                      f"collection window. Vendor drop may be late.")
             return {"status": "not_ready", "period": period,
                     "remoteDirectory": remote_dir}
 
-        transfer_ids = transfer_batches(remote_dir, names, dest_prefix)
+        if not new_files:
+            print(f"No new files; {len(pulled)} already collected")
+            return {"status": "no_new_files", "period": period,
+                    "totalPulled": len(pulled)}
 
-        write_marker(period, {
-            "period": period,
-            "remoteDirectory": remote_dir,
-            "destinationPrefix": dest_prefix,
-            "fileCount": len(names),
-            "files": names,
-            "transferIds": transfer_ids,
-            "startedAt": datetime.now(TZ).isoformat(),
-        })
+        transfer_ids = transfer_batches(remote_dir, new_files, dest_prefix)
 
-        return {"status": "transfer_started", "period": period,
-                "fileCount": len(names), "transferIds": transfer_ids,
+        now = datetime.now(TZ).isoformat()
+        ledger["pulledFiles"] = sorted(pulled | set(new_files))
+        ledger["waves"].append({"at": now, "added": new_files,
+                                "transferIds": transfer_ids})
+        ledger.setdefault("firstSeenAt", now)
+        ledger["lastUpdatedAt"] = now
+        write_ledger(period, ledger)
+
+        # New files on the last tick means the vendor was still uploading
+        # when the window closed - the month is probably incomplete.
+        if final:
+            alert(f"Statement sync: files still arriving for {period}",
+                  f"{len(new_files)} new file(s) appeared on the final "
+                  f"collection attempt. The month may be incomplete.")
+
+        return {"status": "transferred", "period": period,
+                "newFiles": len(new_files), "totalPulled": len(ledger["pulledFiles"]),
+                "wave": len(ledger["waves"]), "transferIds": transfer_ids,
                 "destinationPrefix": dest_prefix}
 
     except Exception as e:

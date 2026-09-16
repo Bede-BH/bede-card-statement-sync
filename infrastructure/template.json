@@ -15,12 +15,12 @@
     "CodeBucket": {
       "Type": "String",
       "Default": "273366118370-artifacts-eu-west-1",
-      "Description": "Artifact bucket holding the Lambda zips. MUST be in the same region as this stack."
+      "Description": "Artifact bucket holding the Lambda zips. Cross-account is fine with a bucket policy; cross-region is not, because Lambda requires the deployment-package bucket to match the function's region."
     },
     "ConnectorId": {
       "Type": "String",
       "Default": "c-4b33fa70fe1846509",
-      "Description": "Existing Transfer Family SFTP connector. Its access role must be extended to this bucket before deploying."
+      "Description": "Existing Transfer Family SFTP connector, shared with account-sync. Verify its access role covers this bucket before deploying."
     },
     "RemoteDirectoryBasePath": {
       "Type": "String",
@@ -47,7 +47,7 @@
     },
     "PullVendorStatementsVersion": {
       "Type": "String",
-      "Default": "v1.0",
+      "Default": "v1.2",
       "Description": "Version suffix of the pull Lambda zip in the artifact bucket."
     },
     "DecryptVendorStatementVersion": {
@@ -57,13 +57,13 @@
     },
     "SchedulerCronExpression": {
       "Type": "String",
-      "Default": "cron(0 * 1 * ? *)",
-      "Description": "Hourly on day 1 of every month. The calendar caps polling at 24 attempts."
+      "Default": "cron(0 16-23 1 * ? *)",
+      "Description": "Hourly from 16:00 to 23:00 on day 1. Vendor states files are available from 14:00; the window starts two hours later and each tick collects whatever is new."
     },
     "SchedulerTimezone": {
       "Type": "String",
-      "Default": "UTC",
-      "Description": "IANA timezone name for the cron expression, also passed to the Lambda so period resolution and FinalAttemptHour agree with it. Use UTC or Asia/Bahrain (UTC+3). Note GMT is UTC+0, not Bahrain time."
+      "Default": "Asia/Bahrain",
+      "Description": "IANA timezone for the cron expression, also passed to the Lambda so period resolution and FinalAttemptHour agree with it. Must be Asia/Bahrain for the 16:00-23:00 window to mean local time."
     },
     "SchedulerEnabled": {
       "Type": "String",
@@ -77,7 +77,7 @@
     "FinalAttemptHour": {
       "Type": "Number",
       "Default": 23,
-      "Description": "Hour, in SchedulerTimezone, after which a still-empty vendor folder raises an alert."
+      "Description": "Hour, in SchedulerTimezone, of the last tick in the window. Alerts if nothing arrived by then, or if new files were still appearing on that tick."
     },
     "MaxListingItems": {
       "Type": "Number",
