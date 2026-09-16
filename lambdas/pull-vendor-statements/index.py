@@ -42,7 +42,9 @@ TZ = ZoneInfo(os.environ.get("TIMEZONE", "UTC"))
 # Hard API limit - StartFileTransfer accepts at most 10 RetrieveFilePaths.
 BATCH_SIZE = 10
 POLL_SECONDS = 5
-MAX_POLLS = 60
+# 90s, not 300s. Existence is settled by the parent-folder check below, so
+# this only has to cover normal listing latency (a few seconds).
+MAX_POLLS = 18
 THROTTLE_BASE_DELAY = 5
 THROTTLE_MAX_RETRIES = 6
 
@@ -126,25 +128,25 @@ def listing_key(resp):
     return f"listings/{CONNECTOR_ID}-{resp.get('ListingId', '')}.json"
 
 
-def list_remote_files(remote_dir):
-    """Return filenames in the vendor folder, or None if it is not there yet.
+def run_listing(remote_dir):
+    """Run one directory listing and return the parsed JSON, or None.
 
-    None means "not ready" - on 1 September at 00:00 the Aug26 folder may not
-    exist at all. That is expected, not a failure.
+    StartDirectoryListing is asynchronous: it validates the connector, returns
+    a ListingId immediately, and only then tries to reach the path. A bad path
+    fails out of band and simply never writes a listing to S3, so None here
+    means either "path unreachable" or "listing unusually slow" - the caller
+    cannot tell them apart, which is why folder existence is settled
+    separately by folder_exists().
     """
-    try:
-        resp = transfer.start_directory_listing(
-            ConnectorId=CONNECTOR_ID,
-            RemoteDirectoryPath=remote_dir,
-            OutputDirectoryPath=f"/{BUCKET}/listings",
-            MaxItems=MAX_LISTING_ITEMS)
-    except transfer.exceptions.ResourceNotFoundException:
-        print(f"Remote directory {remote_dir} not found yet")
-        return None
+    resp = transfer.start_directory_listing(
+        ConnectorId=CONNECTOR_ID,
+        RemoteDirectoryPath=remote_dir,
+        OutputDirectoryPath=f"/{BUCKET}/listings",
+        MaxItems=MAX_LISTING_ITEMS)
 
     key = listing_key(resp)
     if wait_for_object(key) is None:
-        print(f"Listing {key} never appeared - treating as not ready")
+        print(f"Listing {key} for {remote_dir} never appeared")
         return None
 
     body = json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
@@ -152,6 +154,37 @@ def list_remote_files(remote_dir):
         raise RuntimeError(
             f"Listing of {remote_dir} was truncated at {MAX_LISTING_ITEMS} items. "
             "Raise MaxListingItems.")
+    return body
+
+
+def folder_exists(folder):
+    """Is the MMMYY month folder present under the base directory?
+
+    Listing the parent is definitive: the listing JSON carries a "path" entry
+    for every subdirectory one level deep. The base directory is permanent, so
+    a failure here is a real error rather than an absent month.
+    """
+    body = run_listing(BASE_DIR)
+    if body is None:
+        raise RuntimeError(
+            f"Could not list the base directory {BASE_DIR}. This folder is "
+            "permanent, so this indicates a connector or credentials problem, "
+            "not a late vendor upload.")
+
+    names = set()
+    for d in (body.get("paths") or []):
+        path = d.get("path") if isinstance(d, dict) else d
+        names.add((path or "").rstrip("/").rsplit("/", 1)[-1])
+
+    print(f"Subfolders under {BASE_DIR}: {sorted(names)}")
+    return folder in names
+
+
+def list_remote_files(remote_dir):
+    """Filenames directly inside the month folder."""
+    body = run_listing(remote_dir)
+    if body is None:
+        return []
 
     names = []
     for f in body.get("files", []):
@@ -215,7 +248,20 @@ def lambda_handler(event, context):
             ledger = load_ledger(period, remote_dir, dest_prefix)
 
         pulled = set(ledger.get("pulledFiles", []))
-        listed = set(list_remote_files(remote_dir) or [])
+
+        # Settle existence before listing the month folder. Without this a
+        # missing folder is indistinguishable from a slow listing and costs
+        # the full poll window on every tick.
+        if not folder_exists(folder):
+            print(f"Vendor folder {folder} does not exist yet under {BASE_DIR}")
+            if final:
+                alert(f"Statement sync: folder {folder} missing",
+                      f"The vendor never created {remote_dir}. No statements "
+                      f"collected for {period}.")
+            return {"status": "folder_missing", "period": period,
+                    "remoteDirectory": remote_dir}
+
+        listed = set(list_remote_files(remote_dir))
 
         # Filename set, not count. A vendor-side swap that leaves the count
         # unchanged would be invisible to a count comparison.
@@ -226,11 +272,12 @@ def lambda_handler(event, context):
                   f"listed remotely: {gone}")
 
         if not listed:
+            print(f"Folder {folder} exists but is empty")
             if final:
                 alert(f"Statement sync: no files for {period}",
-                      f"Nothing found in {remote_dir} by the end of the "
-                      f"collection window. Vendor drop may be late.")
-            return {"status": "not_ready", "period": period,
+                      f"{remote_dir} exists but is still empty at the end of "
+                      f"the collection window. Vendor upload may be late.")
+            return {"status": "folder_empty", "period": period,
                     "remoteDirectory": remote_dir}
 
         if not new_files:

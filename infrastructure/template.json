@@ -47,7 +47,7 @@
     },
     "PullVendorStatementsVersion": {
       "Type": "String",
-      "Default": "v1.2",
+      "Default": "v1.3",
       "Description": "Version suffix of the pull Lambda zip in the artifact bucket."
     },
     "DecryptVendorStatementVersion": {
