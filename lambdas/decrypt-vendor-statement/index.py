@@ -65,6 +65,30 @@ def decrypt(key, passphrase, msg):
     raise RuntimeError(f"Could not unlock the PGP key with the stored passphrase: {last}")
 
 
+def move_seq_to_end(name):
+    """Reorder <Seq>_<CPR>_<Product> Statement <date>.pdf so CPR leads.
+
+    S3 ListObjectsV2 filters on prefix only - no contains, no suffix. With Seq
+    first, the consuming vendor has to list an entire month and filter client
+    side to find one customer. With CPR first they can request
+    decrypted/YYYY-MM/<CPR> directly.
+
+    Seq is moved rather than dropped: it is what keeps keys unique when one
+    customer has two files for the same product and date, and S3 overwrites
+    colliding keys silently.
+
+    Names without a numeric leading segment pass through untouched.
+    """
+    seq, sep, rest = name.partition("_")
+    # Three segments required: seq_CPR_product. Testing only that the first
+    # segment is numeric is not enough, because a CPR is numeric too - a name
+    # already leading with CPR would have it wrongly shunted to the end.
+    if not sep or not seq.isdigit() or "_" not in rest:
+        return name
+    stem, dot, ext = rest.rpartition(".")
+    return f"{stem}_{seq}.{ext}" if dot else f"{rest}_{seq}"
+
+
 def dest_key(src_key):
     parts = src_key.split("/")
     period = parts[1] if len(parts) > 2 else "unknown"
@@ -72,7 +96,7 @@ def dest_key(src_key):
     low = name.lower()
     if low.endswith(".pgp") or low.endswith(".gpg"):
         name = name[:-4]
-    return f"decrypted/{period}/{name}"
+    return f"decrypted/{period}/{move_seq_to_end(name)}"
 
 
 def process(bucket, src_key):
